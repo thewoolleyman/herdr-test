@@ -143,6 +143,14 @@ Actual shades depend on the theme. The v0.9.3 mobile renderer uses blue for Done
 `ui.status_indicators = "symbols"` selects the alternate static glyphs.
 See also [status concepts](https://herdr.dev/docs/concepts/).
 
+With `agent_panel_sort = "priority"`, Blocked agents sort to the top of the agent
+panel, but the panel keeps its scroll offset as rows reorder. A red × on a
+workspace with no × visible in the agent panel usually means the panel is
+scrolled down; scroll it to the top. Rows from a machine whose connection is not
+Online sort last and render dimmed gray, per the v0.9.3
+[aggregate sort](https://github.com/herdrdev/herdr/blob/v0.9.3/src/client/shell/aggregate_navigation.rs).
+Observed 2026-10-14.
+
 ## Pane text selection
 
 For iTerm2 intercepting right-clicks on Herdr tabs, check **Settings → Profiles →
