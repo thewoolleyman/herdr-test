@@ -315,6 +315,213 @@ sessions and cleanup; ordinary unit-suite isolation must enforce the same
 production-session protection. Clearing environment selectors alone is
 insufficient because backend selection uses process ancestry.
 
+## Interactive latency investigation (2026-11-01)
+
+Read-only checks on the VPS at approximately 21:33–21:38 CET found host-side
+contention while the user reported slow typing and pane switching. These are
+point-in-time observations, not a controlled comparison with the earlier snappy
+state:
+
+- The VPS exposed 18 vCPUs; load averages were approximately 52–64. CPU pressure
+  (`/proc/pressure/cpu`, `some avg10`) was approximately 44–55%. Herdr's server
+  main thread accumulated 235 ms of runnable scheduling wait during one roughly
+  two-second probe. Idle CPU in an aggregate sample does not establish responsive
+  scheduling for the thread handling an interactive request.
+- Twenty local `herdr workspace list` calls ranged from about 8 to 424 ms;
+  a separate earlier call took 1.75 seconds. These calls ran directly on the VPS,
+  so the variation exists before adding client/network latency. A separate
+  seven-call sample had a 12 ms median, illustrating the intermittent stalls.
+- An hourly `/etc/cron.hourly/fstrim` job ran `fstrim /` and was still active
+  after approximately 18 minutes. Its kernel stack showed it waiting inside
+  `ext4_trim_fs` / `blkdev_issue_discard`. Disk samples showed hundreds of discard
+  requests per second, with approximately 75–85% device utilization in one
+  window; a later window showed 16–22% host I/O wait. The root filesystem also
+  had the `discard` mount option, and a separate weekly `fstrim.timer` existed.
+  The long trim is a plausible latency contributor, not a proven sole cause.
+  Follow-up inspection found the hourly script owned by `root:root`, last
+  modified on 2026-01-06, and unclaimed by `dpkg-query -S`. Its observed parent
+  chain was system cron → run-parts → script → fstrim. Who installed the script
+  remains unknown. No `fstrim` process remained at the follow-up check.
+- Memory had approximately 58 GiB available, memory pressure was zero, and the
+  root filesystem was 57% full. Sampled CPU steal was zero, and inspected Herdr
+  cgroups and ancestors had no CPU quota throttling. These checks did not support
+  RAM exhaustion, full root storage, or a cgroup CPU quota as the immediate cause.
+- Herdr 0.9.3 served seven workspaces, 55 tabs, 58 panes, and 35 detected agents.
+  A separate three-second `/proc/stat` sample measured approximately 76 process
+  creations per second across the host, consistent with substantial process churn.
+  Both inspected VPS client processes were descendants of Tailscale SSH. Their
+  existence does not establish which client the user was viewing; client/device
+  and network contributions were not measured end to end.
+- An existing diagnostic service used BPF only for process-exit events. Its
+  presence alone is not evidence that tracing caused the slowdown. Recent client
+  warnings mostly concerned failed notification audio playback; these were not
+  established as the cause of typing/pane-switch latency.
+
+Initial suggested next checks, not applied: reduce concurrent background tests and
+polling/process churn, review whether the custom hourly trim is needed alongside
+the weekly timer and online discard, and compare local API and interactive
+latency after trim completes. A controlled before/after measurement is needed
+to attribute improvement to a specific change. No live sessions were stopped,
+and no host configuration was changed during that initial pass.
+
+### Follow-up: cross-vCPU synchronization stalls
+
+At 22:12 CET, with **no fstrim process running**, the lag was still reproducible:
+40 local CLI calls had a 170 ms median and a 3.96 second maximum. CPU pressure
+was approximately 75%, while I/O wait averaged approximately 1%. A new hourly
+trim started later, around 22:17; its recurrence cannot explain the already
+measured stalls while no trim was running.
+
+Further profiling established a specific mechanism:
+
+- A system-wide CPU-clock profile contained 7,805 samples. Approximately 36%
+  landed in `smp_call_function_many_cond`, predominantly through TLB flushes
+  during memory-map changes. Of 2,804 sampled stacks containing that function,
+  1,264 came through `madvise`; the other callers included process exit, fork,
+  exec, and `munmap`. Claude/Bun's `mi-scavenger`, `HeapHelper`, and `JITWorker`
+  threads were prominent callers. This attributes sampled work, not exclusive
+  blame to one application or release.
+- A separate Herdr server profile contained 810 samples. Approximately 43%
+  landed in the same cross-vCPU synchronization function; all 352 stacks
+  containing it came through `munmap`. A syscall trace independently observed
+  Herdr unmaps taking hundreds of milliseconds, including 390 ms on the server's
+  main thread, alongside long futex waits. Futex duration alone is not proof of
+  a bug, since a worker can legitimately sleep waiting for work.
+- Direct Unix-socket requests excluded CLI startup and SSH. In parallel samples
+  of 25 valid requests each, `ping` had a 0.8 ms median, while `workspace.list`
+  had a 477 ms median and a 3.69 second maximum. The
+  [v0.9.3 API server source](https://github.com/herdrdev/herdr/blob/v0.9.3/src/api/server.rs)
+  handles `ping` directly but dispatches workspace requests to the app loop.
+  Another workspace request reached 5.52 seconds. These observations locate
+  substantial delay in the server/app path without establishing every lock's owner.
+- Kernel CSD tracepoints, filtered specifically to `flush_tlb_func`, showed
+  queued remote TLB callbacks taking up to approximately 373 ms to reach entry.
+  Per-vCPU mean queue delays in that window ranged from approximately 4 to 36 ms.
+  A separate unfiltered callback trace had longer tails, but those must not all
+  be labelled TLB flushes.
+- A reversible affinity experiment confined the existing Herdr server threads
+  to one vCPU briefly. Workspace-request median latency was 56 ms before,
+  4.9 ms during, and 65.5 ms after restoration. P95 was approximately
+  585 / 238 / 547 ms respectively. Host CPU pressure remained high throughout.
+  This supports a material contribution from cross-vCPU coordination, but did
+  not eliminate latency tails. All server threads were verified restored to
+  their original 18-vCPU affinity. A permanent single-vCPU pin was **not**
+  applied: new pane processes could inherit that affinity and lose parallelism.
+
+The likely underlying amplifier is VM CPU scheduling or throttling, with two
+important qualifications about the available evidence:
+
+- Across three five-second windows, `/proc/stat` accounted for only
+  56.58 / 47.85 / 55.85 CPU-seconds, including idle, against approximately
+  90 wall-clock CPU-seconds expected from 18 vCPUs. This is consistent with
+  unreported lost execution time, but guest accounting alone cannot distinguish
+  host contention, provider CPU throttling, and a guest accounting defect.
+- CPUID leaf `0x40000001` returned EAX `0x010000db`: KVM steal-time reporting,
+  paravirtual TLB flush, and paravirtual IPI feature bits were all absent.
+  The running kernel also had `CONFIG_PARAVIRT_TIME_ACCOUNTING` disabled.
+  **The earlier 0% steal measurement does not rule out host contention.** See
+  the kernel's [KVM CPUID documentation](https://docs.kernel.org/virt/kvm/x86/cpuid.html).
+
+Disposable memory-discard probes outside Herdr normally completed in
+microseconds, but longer samples also encountered 112–413 ms outliers, including
+in a single-vCPU variant. They therefore corroborate general scheduling tails;
+they do not establish that every stall requires a cross-vCPU TLB flush. No
+before-regression baseline or hypervisor-side counters were available.
+
+The immediate bottleneck is established: memory-map cleanup spends substantial
+time on cross-vCPU synchronization, and Herdr's interactive app path stalls.
+Provider-side confirmation is still needed to distinguish host CPU scheduling
+contention from throttling as the underlying cause. A concrete escalation should
+request host vCPU scheduling/CPU-limit counters, investigate the missing CPU-time
+accounting, and check the unavailable KVM paravirtual features. Reducing allocator
+purging and process churn is a potential mitigation, not a verified complete fix;
+the [mimalloc documentation](https://github.com/microsoft/mimalloc#environment)
+describes purge delay and decommit controls, but they were not changed in live
+agents. No Herdr sessions were stopped or upgraded during those probes. Raw profiles remained outside
+this public repository; only reviewed measurements are recorded here.
+
+### Upstream fixes identified before choosing a remedy
+
+The installed 0.9.3 predates relevant fixes released in 0.9.4 and retained in
+0.9.5, per the [0.9.5 changelog](https://github.com/herdrdev/herdr/blob/v0.9.5/CHANGELOG.md).
+Reviewed changes include avoiding per-cell allocations during terminal text
+reads ([PR 4845](https://github.com/herdrdev/herdr/pull/4845)) and avoiding
+unneeded terminal/scroll-metric reads in client snapshots
+([PR 4847](https://github.com/herdrdev/herdr/pull/4847)). The latter separates
+metadata snapshots from terminal reads, relevant to the observed app-loop waits.
+These are concrete application-side leads; an upgrade followed by the same
+latency probes should precede treating provider contention as the sole cause.
+At that stage no upgrade comparison had been performed. The subsequent upgrade
+and its measurements are recorded below; a complete remedy remains unproven.
+
+The [session-state documentation](https://github.com/herdrdev/herdr/blob/v0.9.5/docs/next/website/src/content/docs/session-state.mdx)
+labels live handoff experimental and best effort. Plain `herdr update` can leave
+a compatible old server running, so merely updating the binary does not establish
+that server performance fixes are active. The old sending server's handoff pane
+limit and compatibility must be checked before any live replacement. These
+checks informed the subsequently authorized upgrade recorded below.
+
+## VPS upgrade to 0.9.5 (2026-11-01)
+
+The user authorized a safe upgrade while cleaning up running work. The VPS CLI
+and default session's running server were upgraded from **0.9.3 to 0.9.5** using
+`herdr update --handoff </dev/null` on the stable channel. This replaced the
+running server through live handoff; no stop/restart fallback was used. The
+non-interactive updater was checked to refuse a stop-server fallback after a
+failed handoff. The old server advertised live-handoff support, protocol 22,
+and endpoint generation 1. At the final pre-upgrade snapshot it had 28 panes,
+below its 64-pane handoff limit.
+
+Before the upgrade, the binary, Herdr configuration, saved session metadata,
+live snapshot, and direct pane-shell PID/start-time identities were backed up
+privately under `~/.local/state/herdr-upgrade-backups/<timestamp>/`. Agent settings
+were also backed up before integration installation. Runtime snapshots, hooks,
+settings backups, and raw profiles were not added to this public repository.
+
+Post-upgrade verification found:
+
+- The installed CLI and running server both report 0.9.5. Status reports them
+  compatible, with no pending restart or stale server binary.
+- **All 28 original pane-shell processes survived**, verified by matching PIDs
+  and process start times. All six workspace IDs, 26 tab IDs, and 28 pane IDs
+  remained present, with the same pane locations and working directories.
+- Internal terminal IDs were regenerated during handoff. Automation caching
+  terminal IDs must refresh them from the current snapshot; unchanged pane IDs
+  and surviving shell processes provide the continuity evidence here.
+- The Herdr config file was byte-for-byte unchanged. All server threads had
+  their original 18-vCPU affinity before the upgrade; the earlier diagnostic
+  single-vCPU restriction was not left in place.
+- The user observed the expected client disconnection, reconnected, and reported
+  that it looked good. Tabs and workspaces did **not** need to be closed. In-flight
+  requests and subscriptions can be interrupted even when pane processes survive.
+
+The updater identified stale installed agent integrations. After backing up
+settings, `herdr integration install claude` and `herdr integration install codex`
+updated them to Claude integration v11 and Codex integration v10. Status reports
+both current, with no outdated installed integrations. Claude's unrelated hooks
+and non-hook settings were verified preserved; the parsed Codex config was
+unchanged. These changes were made on the VPS, not on the Mac.
+
+Thirty direct Unix-socket `workspace.list` requests were measured on either side
+of the upgrade, excluding CLI startup and SSH/network latency:
+
+| Measurement | Before: 0.9.3 | After: 0.9.5 |
+| --- | ---: | ---: |
+| Median | 317.53 ms | 32.44 ms |
+| P95 (sorted sample index) | 2,954.49 ms | 531.31 ms |
+| Maximum | 4,835.08 ms | 748.80 ms |
+
+The observed median improved by approximately 9.8 times. Cleanup and background
+work continued during these samples, so this is not an isolated benchmark of
+the version change and does not prove that every source of VPS lag is resolved.
+The upgrade supplies the upstream allocation and terminal-read fixes identified
+above, and the user confirmed that the resulting client experience looked good.
+
+The Mac version was not rechecked or upgraded in this operation. For future
+upgrades, verify current handoff support and limits again, retain private backups,
+and compare live pane processes before and after. The successful result here
+does not make experimental live handoff a guarantee for every future session.
+
 ## Open checks
 
 - Verify Android key authentication and interactive Herdr rendering on the device.

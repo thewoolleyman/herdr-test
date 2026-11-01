@@ -12,6 +12,14 @@ reviewed conversation exports and a shared working summary.
 - [VPS conversation](history/vps.md): spaces, agents, and multi-machine navigation.
 - [Consolidation record](CONSOLIDATION.md): provenance and publication boundaries.
 
+## Latest VPS status
+
+On 2026-11-01 the VPS CLI and running server were upgraded from Herdr 0.9.3 to
+0.9.5 using live handoff. All 28 pane-shell processes, 26 tabs, and six workspaces
+survived. The client briefly disconnected; the user reconnected and reported that
+it looked good. See [the upgrade record](CONTEXT.md#vps-upgrade-to-095-2026-11-01)
+for preservation checks, integration updates, and latency measurements.
+
 ## Local Mac plus remote VPS
 
 Run these in a **Mac shell**, with `vps` configured as an SSH alias:
